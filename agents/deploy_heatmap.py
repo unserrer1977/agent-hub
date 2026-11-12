@@ -31,6 +31,7 @@ HEATMAP_DAYS = int(os.environ.get("HEATMAP_DAYS", "21"))
 SITE_INDEX = "public/index.html"
 
 _repo_owner, _repo_name = SITE_REPO.split("/", 1)
+REPO_PATH = "/repos/%s/%s" % (_repo_owner, _repo_name)
 HOTEL = "https://api.github.com"
 
 # Intensity buckets -> CSS classes (mirrors the site's colour ramp)
@@ -150,7 +151,7 @@ def render_heatmap(activity, days=HEATMAP_DAYS):
         cells.append('</div>')
 
     return (
-        '<div class="dep-heat">'
+        '<div id="dl-heatmap">'
         '<div class="dep-heat-head">Git deployment heat map '
         '<span class="dep-heat-legend">'
         '<i class="lev peak"></i><i class="lev hot"></i>'
@@ -158,73 +159,65 @@ def render_heatmap(activity, days=HEATMAP_DAYS):
         '<i class="lev empty"></i></span>'
         '<span class="dep-heat-count">%d days</span></div>'
         '<div class="dep-heat-grid">%s</div>'
+        '<!-- /dl-heatmap -->'
         '</div>' % (days, "".join(cells))
     )
 
 
 def update_site():
-    """Write the heat map into the site repo and push to SITE_BRANCH."""
+    """Write the heat map into the site repo and push to SITE_BRANCH.
+
+    Uses the GitHub REST 'Update a file' endpoint, which atomically commits the
+    content change to a branch (no manual blob/tree/commit dance).
+    """
     if not GITHUB_TOKEN:
         return {"status": "dry-run", "note": "GITHUB_TOKEN not set; heat map generated but not committed."}
 
-    # 1) fetch current main sha
-    ref = _gh("/repos/%s/git/refs/heads/%s" % (_repo_owner, SITE_BRANCH), token=GITHUB_TOKEN)
-    main_sha = ref["object"]["sha"]
-
-    # 2) fetch existing file
-    info = _gh("/repos/%s/contents/%s" % (_repo_owner, SITE_INDEX), token=GITHUB_TOKEN)
+    # 1) fetch existing file content (and its blob sha, required for updates)
+    info = _gh("%s/contents/%s" % (REPO_PATH, SITE_INDEX), token=GITHUB_TOKEN)
     old_content = base64.b64decode(info["content"]).decode("utf-8")
+    old_sha = info["sha"]
 
-    gh_heat_marker = '<div class="gh-heat" id="ghHeat"></div>'
+    # 2) server-render the heat map and replace the existing block (or insert it
+    #    if the site has not been updated yet).
+    import re
     fragment = render_heatmap(collect_activity())
-    new_content = old_content.replace(gh_heat_marker, fragment, 1)
-    if new_content == old_content:
-        # Fallback: insert the heatmap fragment before the languages section.
-        lang_h4 = '<h4 style="margin:0 0 12px;font-size:14px;letter-spacing:.02em;text-transform:uppercase;color:var(--muted);font-weight:600">'
-        idx = old_content.find(lang_h4)
+    # Short-circuit: if the rendered fragment is already on the site, it is current.
+    if fragment in old_content:
+        return {"status": "unchanged", "note": "Heat map already current."}
+    # Replace an existing heat map block (matched by the dl-heatmap id + marker).
+    pattern = r'<div id="dl-heatmap">.*?<!-- /dl-heatmap --></div>'
+    new_content, count = re.subn(
+        pattern, fragment, old_content, count=1, flags=re.DOTALL
+    )
+    if count == 0:
+        # No existing heat map block: insert before the languages section (or append).
+        marker = '<h4 style="margin:0 0 12px;font-size:14px;letter-spacing:.02em;text-transform:uppercase;color:var(--muted);font-weight:600">'
+        idx = old_content.find(marker)
         if idx != -1:
             new_content = old_content[:idx] + fragment + old_content[idx:]
         else:
-            return {"status": "skipped", "note": "could not locate a heat map anchor in %s" % SITE_INDEX}
+            new_content = old_content + fragment
+    else:
+        new_content = new_content
 
     if new_content == old_content:
         return {"status": "unchanged", "note": "Heat map already current."}
 
-    # 4) create blob
-    blob = _gh(
-        "/repos/%s/git/blobs" % _repo_owner,
-        token=GITHUB_TOKEN,
-        method="POST",
-        payload={"content": new_content.encode("utf-8"), "encoding": "base64"},
-    )
-    blob_sha = blob["sha"]
-
-    # 5) create tree (replace the existing file entry)
-    tree = _gh(
-        "/repos/%s/git/trees" % _repo_owner,
-        token=GITHUB_TOKEN,
-        method="POST",
-        payload={"base_tree": main_sha, "trees": [{"path": SITE_INDEX, "mode": "100644", "type": "blob", "sha": blob_sha}]},
-    )
-    tree_sha = tree["sha"]
-
-    # 6) create commit on main
+    # 3) commit the change via the GitHub REST 'Update a file' endpoint
     commit = _gh(
-        "/repos/%s/git/commits" % _repo_owner,
+        "%s/contents/%s" % (REPO_PATH, SITE_INDEX),
+        method="PUT",
+        payload={
+            "message": "agent: update Git deployment heat map",
+            "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
+            "sha": old_sha,
+            "branch": SITE_BRANCH,
+            "committer": {"name": GITHUB_USERNAME, "email": GITHUB_EMAIL},
+        },
         token=GITHUB_TOKEN,
-        method="POST",
-        payload={"message": "agent: update Git deployment heat map", "tree": tree_sha, "parents": [main_sha]},
     )
-    commit_sha = commit["sha"]
-
-    # 7) update the branch ref
-    _gh(
-        "/repos/%s/git/refs/heads/%s" % (_repo_owner, SITE_BRANCH),
-        token=GITHUB_TOKEN,
-        method="PATCH",
-        payload={"sha": commit_sha, "force": False},
-    )
-    return {"status": "ok", "sha": commit_sha, "branch": SITE_BRANCH}
+    return {"status": "ok", "sha": commit["commit"]["sha"], "branch": SITE_BRANCH}
 
 
 def run():
